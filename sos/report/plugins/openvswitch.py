@@ -57,6 +57,9 @@ class OpenVSwitch(Plugin):
             "ovsdb-client -f list dump",
             # List the contents of runtime directory
             "ls -laZ /run/openvswitch",
+            "ls -laZ /dev/hugepages/",
+            "ls -laZ /dev/vfio",
+            "ls -laZ /var/lib/vhost_sockets",
             # List devices and their drivers
             "dpdk_nic_bind --status",
             "dpdk_devbind.py --status",
