@@ -18,11 +18,18 @@ class OpenVSwitch(Plugin):
 
     short_desc = 'OpenVSwitch networking'
     plugin_name = "openvswitch"
-    profiles = ('network', 'virt')
+    profiles = ('container', 'network', 'virt')
 
     def setup(self):
 
         all_logs = self.get_option("all_logs")
+
+        check_dpdk = False
+        dpdk_enabled = self.collect_cmd_output(
+            "ovs-vsctl get Open_vSwitch . other_config:dpdk-init")
+        if dpdk_enabled["status"] == 0 and \
+           dpdk_enabled["output"].startswith("true"):
+            check_dpdk = True
 
         log_dirs = [
             '/var/log/openvswitch/',
@@ -43,13 +50,6 @@ class OpenVSwitch(Plugin):
         ])
 
         self.add_cmd_output([
-            # The '-s' option enables dumping of packet counters on the
-            # ports.
-            "ovs-dpctl -s show",
-            # Capture the in-kernel flow information if it exists
-            "ovs-dpctl dump-flows -m",
-            # Capture the flow information also for offloaded rules
-            "ovs-dpctl dump-flows type=offloaded -m",
             # The '-t 5' adds an upper bound on how long to wait to connect
             # to the Open vSwitch server, avoiding hangs when running sos.
             "ovs-vsctl -t 5 show",
@@ -65,12 +65,12 @@ class OpenVSwitch(Plugin):
             "dpdk_devbind.py --status",
             "driverctl list-devices",
             "driverctl list-overrides",
-            # Capture a list of all bond devices
             "ovs-appctl bond/list",
             # Capture more details from bond devices
             "ovs-appctl bond/show",
             # Capture LACP details
             "ovs-appctl lacp/show",
+            "ovs-appctl lacp/show-stats",
             # Capture coverage stats"
             "ovs-appctl coverage/show",
             # Capture cached routes
@@ -91,14 +91,14 @@ class OpenVSwitch(Plugin):
             "ovs-vsctl list bridge",
             # Capture DPDK datapath packet counters and config
             "ovs-appctl dpctl/show -s",
-            # Capture DPDK datapath flows
-            "ovs-appctl dpctl/dump-flows",
             # Capture DPDK queue to pmd mapping
             "ovs-appctl dpif-netdev/pmd-rxq-show",
             # Capture DPDK pmd stats
             "ovs-appctl dpif-netdev/pmd-stats-show",
             # Capture DPDK pmd performance counters
-            "ovs-appctl dpif-netdev/pmd-perf-show"
+            "ovs-appctl dpif-netdev/pmd-perf-show",
+            # Capture ofproto tunnel configs
+            "ovs-appctl ofproto/list-tunnels",
         ])
 
         # Gather systemd services logs
@@ -107,19 +107,35 @@ class OpenVSwitch(Plugin):
         self.add_journal(units="ovs-vswitchd")
         self.add_journal(units="ovsdb-server")
 
+        # Gather the datapath information for each datapath
+        dp_list_result = self.collect_cmd_output('ovs-appctl dpctl/dump-dps')
+        if dp_list_result['status'] == 0:
+            for dp in dp_list_result['output'].splitlines():
+                self.add_cmd_output([
+                    "ovs-appctl dpctl/show -s %s" % dp,
+                    "ovs-appctl dpctl/dump-flows -m %s" % dp,
+                    "ovs-appctl dpctl/dump-flows -m %s type=offloaded" % dp,
+                    "ovs-appctl dpctl/dump-conntrack -m %s" % dp,
+                    "ovs-appctl dpctl/ct-stats-show -m %s" % dp,
+                    "ovs-appctl dpctl/ipf-get-status %s" % dp,
+                ])
+
         # Gather additional output for each OVS bridge on the host.
-        br_list_result = self.collect_cmd_output("ovs-vsctl list-br")
+        br_list_result = self.collect_cmd_output("ovs-vsctl -t 5 list-br")
         if br_list_result['status'] == 0:
             for br in br_list_result['output'].splitlines():
                 self.add_cmd_output([
+                    "ovs-appctl bridge/dump-flows --offload-stats %s" % br,
+                    "ovs-appctl dpif/show-dp-features %s" % br,
                     "ovs-appctl fdb/show %s" % br,
+                    "ovs-appctl fdb/stats-show %s" % br,
+                    "ovs-appctl mdb/show %s" % br,
                     "ovs-ofctl dump-flows %s" % br,
                     "ovs-ofctl dump-ports-desc %s" % br,
                     "ovs-ofctl dump-ports %s" % br,
                     "ovs-ofctl queue-get-config %s" % br,
                     "ovs-ofctl queue-stats %s" % br,
                     "ovs-ofctl show %s" % br,
-                    "ovs-appctl fdb/stats-show %s" % br
                 ])
 
                 # Flow protocols currently supported
@@ -127,7 +143,9 @@ class OpenVSwitch(Plugin):
                     "OpenFlow10",
                     "OpenFlow11",
                     "OpenFlow12",
-                    "OpenFlow13"
+                    "OpenFlow13",
+                    "OpenFlow14",
+                    "OpenFlow15"
                 ]
 
                 # List protocols currently in use, if any
@@ -150,18 +168,22 @@ class OpenVSwitch(Plugin):
                             "ovs-ofctl -O %s dump-ports-desc %s" % (flow, br)
                         ])
 
-        # Gather info on the DPDK mempools associated with each DPDK port
-        br_list_result = self.collect_cmd_output("ovs-vsctl -t 5 list-br")
-        if br_list_result['status'] == 0:
-            for br in br_list_result['output'].splitlines():
                 port_list_result = self.exec_cmd(
-                    "ovs-vsctl -t 5 list-ports %s" % br
-                )
+                    "ovs-vsctl -t 5 list-ports %s" % br)
                 if port_list_result['status'] == 0:
                     for port in port_list_result['output'].splitlines():
-                        self.add_cmd_output(
-                            "ovs-appctl netdev-dpdk/get-mempool-info %s" % port
-                        )
+                        self.add_cmd_output([
+                            "ovs-appctl cfm/show %s" % port,
+                            "ovs-appctl qos/show %s" % port,
+                            # Not all ports are "bond"s, but all "bond"s are
+                            # a single port
+                            "ovs-appctl bond/show %s" % port,
+                        ])
+                        # Gather info on the DPDK mempools associated with port
+                        if check_dpdk:
+                            self.add_cmd_output(
+                                "ovs-appctl netdev-dpdk/get-mempool-info %s" % port
+                            )
 
 
 class RedHatOpenVSwitch(OpenVSwitch, RedHatPlugin):
